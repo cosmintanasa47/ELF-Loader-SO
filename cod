@@ -1,0 +1,225 @@
+// SPDX-License-Identifier: BSD-3-Clause
+
+#define _GNU_SOURCE
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <elf.h>
+#include <string.h>
+#include <sys/auxv.h>
+
+void *map_elf(const char *filename)
+{
+    struct stat st;
+    void *file;
+    int fd;
+
+    fd = open(filename, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        exit(1);
+    }
+
+    fstat(fd, &st);
+
+    file = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (file == MAP_FAILED) {
+        perror("mmap");
+        close(fd);
+        exit(1);
+    }
+
+    return file;
+}
+
+void load_and_run(const char *filename, int argc, char **argv, char **envp)
+{
+    void *elf_contents = map_elf(filename);
+    Elf64_Ehdr *elf_struct = (Elf64_Ehdr*)elf_contents;
+    if(elf_struct->e_ident[EI_MAG0]!=ELFMAG0 || elf_struct->e_ident[EI_MAG1]!=ELFMAG1 || 
+       elf_struct->e_ident[EI_MAG2]!=ELFMAG2 || elf_struct->e_ident[EI_MAG3]!=ELFMAG3) {
+        fprintf(stderr,"Not a valid ELF file\n");
+        exit(3);
+    }
+    if(elf_struct->e_ident[EI_CLASS]!=ELFCLASS64) {
+        fprintf(stderr,"Not a 64-bit ELF\n");
+        exit(4);
+    }
+    int is_pie = (elf_struct->e_type == ET_DYN);
+    uint64_t load_base = 0;
+    if (is_pie) 
+        load_base = 0x70000000000 ;
+    Elf64_Phdr *elf_progHeader = (Elf64_Phdr*)(elf_contents + elf_struct->e_phoff);
+    int n = elf_struct->e_phnum;
+    for(int i = 0; i < n; i++) {
+        Elf64_Phdr *tempHeader = elf_progHeader + i;
+        if(tempHeader->p_type == PT_LOAD) {
+            uint64_t page_size = 4096;
+            uint64_t vaddr = tempHeader->p_vaddr;
+            if (is_pie) {
+                vaddr += load_base;
+            }
+            uint64_t align_address = (vaddr /page_size)*page_size;
+            uint64_t offset = vaddr - align_address;
+            uint64_t size_total = tempHeader->p_memsz + offset;
+            size_total = ((size_total + page_size - 1) /page_size)*page_size;
+            int protections = 0;
+            if(tempHeader->p_flags & PF_R)
+                protections |= PROT_READ;
+            if(tempHeader->p_flags & PF_W)
+                protections |= PROT_WRITE;
+            if(tempHeader->p_flags & PF_X)
+                protections |= PROT_EXEC;
+            void *mapare = mmap((void*)align_address, size_total, 
+                               PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | (is_pie ? 0 : MAP_FIXED), 
+                               -1, 0);
+            if(mapare == MAP_FAILED) {
+                perror("failed mapping");
+                exit(5);
+            }
+            
+            if (tempHeader->p_filesz > 0) {
+                memcpy((char*)mapare + offset, 
+                       (char*)elf_contents + tempHeader->p_offset, 
+                       tempHeader->p_filesz);
+            }
+            if(tempHeader->p_memsz > tempHeader->p_filesz) {
+                size_t bss_rest = tempHeader->p_memsz - tempHeader->p_filesz;
+                memset((char*)mapare + offset + tempHeader->p_filesz, 0, bss_rest);
+            }
+            if (mprotect(mapare, size_total, protections) == -1) {
+                perror("mprotect fail");
+                exit(6);
+            }
+        }
+    }
+    Elf64_Addr phdr_addr = 0;
+    for (int i = 0; i < n; i++) {
+        Elf64_Phdr *phdr_temp= elf_progHeader + i;
+        if (phdr_temp->p_type == PT_PHDR) {
+            phdr_addr = load_base + phdr_temp->p_vaddr;
+            break;
+        }
+    }
+    if (!phdr_addr) {
+        for (int i = 0; i < n; i++) {
+            Elf64_Phdr *phdr_temp = elf_progHeader + i;
+            if (elf_struct->e_phoff >= phdr_temp->p_offset && 
+                elf_struct->e_phoff < phdr_temp->p_offset + phdr_temp->p_filesz) {
+                phdr_addr = load_base + phdr_temp->p_vaddr + (elf_struct->e_phoff - phdr_temp->p_offset);
+                break;
+            }
+        }
+    }
+    if (!phdr_addr) {
+        phdr_addr = load_base + elf_struct->e_phoff;
+    }
+    int envc = 0;
+    while (envp[envc]) envc++;
+    size_t stack_size = 8 * 1024 * 1024;
+    void *stack = mmap((void*)0x700000000000, stack_size, PROT_READ | PROT_WRITE, 
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+    if (stack == MAP_FAILED) {
+        stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE, 
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+        if (stack == MAP_FAILED) {
+            perror("mmap stack failed");
+            exit(7);
+        }
+    }
+    char *stack_top = (char *)stack + stack_size;
+    uint64_t *sp = (uint64_t *)stack_top;
+    char *argv_ptrs[argc + 1];
+    char *envp_ptrs[envc + 1];
+    for (int i = 0; i < argc; i++) {
+        size_t len = strlen(argv[i]) + 1;
+        stack_top -= len;
+        memcpy(stack_top, argv[i], len);
+        argv_ptrs[i] = stack_top;
+    }
+    for (int i = 0; i < envc; i++) {
+        size_t len = strlen(envp[i]) + 1;
+        stack_top -= len;
+        memcpy(stack_top, envp[i], len);
+        envp_ptrs[i] = stack_top;
+    }
+    stack_top = (char *)(((uint64_t)stack_top/16)*16);
+    sp = (uint64_t *)stack_top;
+    sp -= 2;
+    uint64_t random_bytes[2];
+    random_bytes[0] = rand();
+    random_bytes[1] = rand();
+    memcpy(sp, random_bytes, 16);
+    uint64_t random_addr = (uint64_t)sp;
+    sp--;
+    *sp = 0;
+    sp--;
+    *sp = AT_NULL;
+    sp--;
+    *sp = random_addr;
+    sp--;
+    *sp = AT_RANDOM;
+    sp--;
+    *sp = load_base + elf_struct->e_entry;
+    sp--;
+    *sp = AT_ENTRY;
+    sp--;
+    *sp = elf_struct->e_phnum;
+    sp--;
+    *sp = AT_PHNUM;
+    sp--;
+    *sp = sizeof(Elf64_Phdr);
+    sp--;
+    *sp = AT_PHENT;    
+    sp--;
+    *sp = phdr_addr;
+	sp--;
+    *sp = AT_PHDR;
+    sp--;
+    *sp = 4096;
+    sp--;
+    *sp = AT_PAGESZ;
+    sp--;
+    *sp = 0;
+    for (int i = envc - 1; i >= 0; i--) {
+        sp--;
+        *sp = (uint64_t)envp_ptrs[i];
+    }
+    sp--;
+    *sp = 0;
+    for (int i = argc - 1; i >= 0; i--) {
+        sp--;
+        *sp = (uint64_t)argv_ptrs[i];
+    }
+    sp--;
+    *sp = argc;
+
+    void *final_sp = sp;
+    void (*entry)() = (void (*)())(load_base + elf_struct->e_entry);
+
+    // Transfer control
+    __asm__ __volatile__(
+        "mov %0, %%rsp\n\t"
+        "xor %%rbp, %%rbp\n\t"
+        "jmp *%1\n\t"
+        :
+        : "r"(final_sp), "r"(entry)
+        : "memory"
+    );
+}
+
+int main(int argc, char **argv, char **envp)
+{
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <static-elf-binary>\n", argv[0]);
+        exit(1);
+    }
+
+    load_and_run(argv[1], argc - 1, &argv[1], envp);
+    return 0;
+}
